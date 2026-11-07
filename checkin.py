@@ -356,6 +356,8 @@ class API:
             result["message"] = message
         else:
             self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+            if code == CheckinStatus.FAILURE.value and message in ("没有权限", "No permission"):
+                self._log("warning", LogEmoji.WARNING, "当前域名拒绝此 Cookie 的认证。若该账号在所有域名均失败，请重新登录并更新 GLADOS_COOKIES。", force=True)
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
             result["points"] = "0"
@@ -583,8 +585,10 @@ class Checker:
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def main() -> int:
+    """执行签到并返回退出码。"""
+    config = None
+    exit_code = 1
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -604,16 +608,33 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            # 每个 Cookie 只需要在一个域名签到成功或已签到。
+            checked_in = {
+                result.cookie_index
+                for result in checker.results
+                if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+            }
+            failed_cookies = [
+                str(index)
+                for index in range(1, len(config.cookies_list) + 1)
+                if index not in checked_in
+            ]
+            if failed_cookies:
+                logger.error(f"Cookie 编号 {', '.join(failed_cookies)} 在所有域名均未签到成功。")
+            else:
+                exit_code = 0
+
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        title, content = "# 脚本执行出错", str(e)
 
     # 4. 发送推送
-    logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
+    if config is not None:
+        logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
+        PushService(config).send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
