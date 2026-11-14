@@ -1,3 +1,22 @@
+# 2026-11-14 签到协议升级（当前状态）
+
+在保留现有环境变量、默认不兑换、每个Cookie至少一个域名成功才退出0的规则下，增量适配官网当前流程。
+
+- 每次提交前先获取 `/api/user/checkin/challenge`，使用新的nonce及有效期；按官网公开算法生成proof，遵守2.5秒等待，再以JSON提交。
+- 仅在服务端未要求Turnstile时使用该自动路径；服务端要求人机验证时停止，不提交伪造token，不把该次计为成功。挑战获取失败/格式错误/过期也停止，不降级到旧请求。
+- 设备校验恢复后重新获取nonce；不自动重放POST。保留既有表单兑换接口，兑换仍默认关闭。
+- 识别新版 `code=0, repeated=true` 为今日已签到，保持旧版code=1兼容，不重复算新增积分。日志/推送增加域名；Actions摘要说明需要官网操作的原因，不含Cookie。
+
+验证：20项隔离测试通过。对当前已登录账号的一次真实脚本探针返回“官网要求本人完成人机验证”，实际GET=1、POST=0。因此本次已完成协议兼容升级，**尚未恢复该账号在GitHub上的无人值守签到**。2026-11-14已通过官网正常按钮签到，+2积分、总112；这与自动化验收分开。
+
+本机测试：`python -m unittest discover -p "test_*.py"`。运行：`python checkin.py`。仍使用原来的 `GLADOS_COOKIES`、`PUSHDEER_SENDKEY`、`GLADOS_EXCHANGE_PLAN`、`GLADOS_VERBOSE`，没有新增密钥或收费服务。
+
+依据：[原项目上游协议提交](https://github.com/Devilstore/Glados-Railgun-checkin/commit/7bdf82255532dd1317aadde594244b743d408763)、[上游新验证问题](https://github.com/Devilstore/Glados-Railgun-checkin/issues/60)，以及2026-11-14已读取的官网前端。上游约547 Stars、12个未关闭Issue、17个已关闭Issue；新验证Issue仍未解决，不能只凭Stars或“已恢复”宣传作结论。此升级只参考协议和实现思路，保留本仓库原GPLv3许可证，不整仓库同步上游重构。
+
+下面保留原说明作为历史与配置参考；当前限制以上文为准。
+
+---
+
 # Glados自动签到
 
 ## 食用方式：
@@ -79,6 +98,7 @@
 ## 声明
 
 本项目不保证稳定运行与更新, 因GitHub相关规定可能会删库, 请注意备份
+
 
 
 

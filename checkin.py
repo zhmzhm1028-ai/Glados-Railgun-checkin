@@ -2,6 +2,8 @@ import requests
 import json
 import os
 import logging
+import hashlib
+import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -31,6 +33,7 @@ class APIEndpoint(Enum):
     """API端点"""
 
     CHECKIN = "/api/user/checkin"
+    CHECKIN_CHALLENGE = "/api/user/checkin/challenge"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
@@ -186,6 +189,9 @@ class API:
     """API 调用"""
 
     CHECKIN_URL = APIEndpoint.CHECKIN.value
+    CHALLENGE_URL = APIEndpoint.CHECKIN_CHALLENGE.value
+    CHALLENGE_SUFFIX = "glados-observe-v1"
+    CHALLENGE_DELAY_SECONDS = 2.5
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
@@ -203,7 +209,7 @@ class API:
             total=3,
             backoff_factor=1.0,
             status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET", "POST"),
+            allowed_methods=("GET",),
             raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -255,7 +261,7 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None, json_body: bool = False) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
         if user_agent:
@@ -264,7 +270,8 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                body = {"json": data} if json_body else {"data": data}
+                response = self.session.post(url, headers=session_headers, timeout=(60, 120), **body)
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
@@ -304,9 +311,42 @@ class API:
 
         return self._parse_checkin(raw)
 
+    def _prepare_checkin(self, cookies: str, user_agent: str) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """Follow the first-party nonce/proof protocol; never manufacture human verification."""
+        response = self._make_request(self._get_full_url(self.CHALLENGE_URL), "GET", cookies=cookies, user_agent=user_agent)
+        if response is None:
+            return None, {"code": -2, "reason": "challenge-unavailable", "message": "无法获取签到挑战，本次未提交签到。"}
+        try:
+            challenge = response.json()
+        except ValueError:
+            challenge = None
+        if not isinstance(challenge, dict) or type(challenge.get("code")) is not int:
+            return None, {"code": -2, "reason": "challenge-invalid", "message": "签到挑战响应无效，本次未提交签到。"}
+        if challenge["code"] != 0:
+            return None, challenge
+        # A sitekey means the server requires Cloudflare verification. Leave it
+        # to the official page; cookies and the public proof hash cannot replace it.
+        if challenge.get("turnstile"):
+            return None, {"code": 5, "reason": "turnstile", "message": "官网要求本人完成人机验证，本次未提交自动签到。"}
+        nonce = challenge.get("nonce")
+        ttl = challenge.get("ttl", 300000)
+        if not isinstance(nonce, str) or not nonce.strip() or len(nonce) > 4096 or type(ttl) not in (int, float) or not 0 < ttl <= 3600000:
+            return None, {"code": -2, "reason": "challenge-invalid", "message": "签到挑战缺少有效 nonce/ttl，本次未提交签到。"}
+        started = time.monotonic()
+        if ttl <= self.CHALLENGE_DELAY_SECONDS * 1000:
+            return None, {"code": -2, "reason": "challenge-expired", "message": "签到挑战有效期不足，本次未提交签到。"}
+        time.sleep(self.CHALLENGE_DELAY_SECONDS)
+        if (time.monotonic() - started) * 1000 >= ttl:
+            return None, {"code": -2, "reason": "challenge-expired", "message": "签到挑战已过期，本次未提交签到。"}
+        proof = hashlib.sha256((nonce + "." + self.CHALLENGE_SUFFIX).encode("utf-8")).hexdigest()
+        return {"token": self.domain, "nonce": nonce, "proof": proof, "tsState": "off"}, None
+
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
-        """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        """Use a fresh challenge for every attempt, including device recovery."""
+        payload, error = self._prepare_checkin(cookies, user_agent)
+        if error is not None:
+            return error
+        response = self._make_request(url, "POST", payload, cookies, user_agent=user_agent, json_body=True)
         if not response:
             return None
         try:
@@ -315,6 +355,8 @@ class API:
             self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
             return None
 
+        if not isinstance(raw, dict):
+            return {"code": -2, "reason": "response-invalid", "message": "签到响应格式无效"}
         # 缓存学得的设备 UA，供本次运行后续请求复用
         if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
             login_device = raw.get("loginDevice")
@@ -334,15 +376,21 @@ class API:
             "code": CheckinStatus.FAILURE,
         }
 
-        if not raw:
-            result["message"] = "网络请求失败"
+        if not isinstance(raw, dict) or not raw:
+            result["message"] = "网络请求失败或响应格式无效"
             return result
 
         code = raw.get("code", -2)
         message = raw.get("message", "无消息字段")
         points = str(raw.get("points", 0))
 
-        if code == CheckinStatus.SUCCESS.value:
+        if type(code) is not int:
+            result["message"] = "签到响应缺少有效状态码"
+            return result
+
+        if code == CheckinStatus.SUCCESS.value and raw.get("repeated") is True:
+            result.update(code=CheckinStatus.REPEAT, status="今日已签到", points="0", message=message)
+        elif code == CheckinStatus.SUCCESS.value:
             self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
             result["code"] = CheckinStatus.SUCCESS
             result["status"] = "签到成功"
@@ -362,6 +410,11 @@ class API:
             result["status"] = "签到失败"
             result["points"] = "0"
             result["message"] = message
+            if code == 5:
+                result["status"] = "需要官网验证（本次未签到）"
+                self._log("warning", LogEmoji.WARNING, "Cloudflare 验证未通过：请本人在官网登录并完成签到页要求的验证；不要将本次记为成功，也不要反复重试或仅据此认定 Cookie 过期。", force=True)
+            elif code == CheckinStatus.FAILURE.value and message in ("没有权限", "No permission"):
+                result["status"] = "该域名未接受登录凭证"
 
         return result
 
@@ -527,6 +580,7 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
+            result.points = str(checkin_result.get("points", "0"))
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
 
             # 3. 获取积分
@@ -567,18 +621,35 @@ class Checker:
         send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
-            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            line = f"#{i} {res['domain']} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
             send_content_lines.append(line)
 
             if self.config.verbose:
                 log_line = line
             else:
-                log_line = f"#{i} {res['status']}"
+                log_line = f"#{i} {res['domain']}: {res['status']}"
             log_content_lines.append(log_line)
 
         content = "\n".join(send_content_lines)
         log_content = "\n".join(log_content_lines)
         return title, content, log_content
+
+    def write_actions_summary(self) -> None:
+        """Expose actionable per-domain results without cookies or raw responses."""
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if not path:
+            return
+        lines = ["## GLaDOS 签到结果", "", "| Cookie 编号 | 域名 | 本次结果 |", "| --- | --- | --- |"]
+        for result in self.results:
+            lines.append(f"| {result.cookie_index} | {result.domain} | {result.status} |")
+        if any("需要官网验证" in result.status for result in self.results):
+            lines += ["", "Cloudflare 验证未通过，本次没有签到。请本人打开 [GLaDOS](https://glados.cloud/)，登录并完成签到页要求的验证。不能仅凭此错误认定 Cookie 失效；脚本不会自动绕过验证。"]
+        lines += ["", "每个 Cookie 至少在一个域名签到成功或已签到，工作流才成功；某个域名拒绝凭证不会被写成该域名成功。", ""]
+        try:
+            with open(path, "a", encoding="utf-8") as summary:
+                summary.write("\n".join(lines))
+        except OSError:
+            logger.warning("无法写入 Actions 摘要，签到结果与退出码仍以日志为准。")
 
 
 # 初始化日志
@@ -606,6 +677,7 @@ def main() -> int:
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             title, content, log_content = checker.format_results()
+            checker.write_actions_summary()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
             # 每个 Cookie 只需要在一个域名签到成功或已签到。
@@ -638,3 +710,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
