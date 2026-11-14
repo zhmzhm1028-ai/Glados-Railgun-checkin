@@ -35,7 +35,7 @@ class ProtocolTests(unittest.TestCase):
     def test_required_human_verification_never_posts_or_forges_a_token(self):
         result,calls=self.run_checkin({'code':0,'nonce':'n','ttl':300000,'turnstile':{'sitekey':'public-site-key'}})
         self.assertEqual(result['code'],app.CheckinStatus.FAILURE);self.assertIn('官网验证',result['status'])
-        self.assertEqual(len(calls),1);self.wait.assert_not_called()
+        self.assertEqual(len(calls),2);self.assertTrue(all(c.args[1]=='GET' for c in calls));self.wait.assert_not_called()
 
     def test_missing_nonce_or_bad_ttl_never_falls_back_to_legacy_post(self):
         for data in [{'code':0},{'code':0,'nonce':4},{'code':0,'nonce':'n','ttl':True},{'code':0,'nonce':'n','ttl':0},{'code':0,'nonce':'n','ttl':float('nan')}]:

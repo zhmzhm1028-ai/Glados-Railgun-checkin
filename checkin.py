@@ -3,6 +3,8 @@ import json
 import os
 import logging
 import hashlib
+import math
+from datetime import datetime, timedelta, timezone
 import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -341,10 +343,34 @@ class API:
         proof = hashlib.sha256((nonce + "." + self.CHALLENGE_SUFFIX).encode("utf-8")).hexdigest()
         return {"token": self.domain, "nonce": nonce, "proof": proof, "tsState": "off"}, None
 
+    def _confirmed_today(self, cookies: str, user_agent: str) -> bool:
+        """A positive first-party check-in record can confirm an attended check-in."""
+        response = self._make_request(self._get_full_url("/api/user/points/trend?days=7"), "GET", cookies=cookies, user_agent=user_agent)
+        if response is None:
+            return False
+        try:
+            result = response.json()
+        except ValueError:
+            return False
+        if not isinstance(result, dict) or type(result.get("code")) is not int or result["code"] != 0 or not isinstance(result.get("data"), dict):
+            return False
+        days = result["data"].get("days")
+        if not isinstance(days, list):
+            return False
+        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        for row in days:
+            if isinstance(row, dict) and row.get("date") == today:
+                earned = row.get("checkin")
+                if type(earned) in (int, float) and math.isfinite(earned) and earned > 0:
+                    return True
+        return False
+
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
         """Use a fresh challenge for every attempt, including device recovery."""
         payload, error = self._prepare_checkin(cookies, user_agent)
         if error is not None:
+            if error.get("reason") == "turnstile" and self._confirmed_today(cookies, user_agent):
+                return {"code": 0, "repeated": True, "points": 0, "message": "官网当日记录已确认签到，本次未重复提交。"}
             return error
         response = self._make_request(url, "POST", payload, cookies, user_agent=user_agent, json_body=True)
         if not response:
